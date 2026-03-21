@@ -1,0 +1,724 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>VRM Viewer - Idle Animation</title>
+  <style>
+    body { margin: 0; overflow: hidden; font-family: Arial, sans-serif; }
+    .box {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      z-index: 20;
+      background: rgba(0, 0, 0, 0.6);
+      color: #fff;
+      border-radius: 10px;
+      padding: 8px 12px;
+      min-width: 200px;
+      max-width: min(70vw, 420px);
+      backdrop-filter: blur(6px);
+    }
+    .box h3 {
+      margin: 0;
+      font-size: 16px;
+      font-weight: 700;
+    }
+    #bridgeStatus {
+      margin-top: 4px;
+      font-size: 12px;
+      opacity: 0.85;
+    }
+    #subtitle {
+      margin-top: 8px;
+      font-size: 13px;
+      line-height: 1.35;
+      word-break: break-word;
+      opacity: 0.95;
+    }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h3>Sana</h3>
+    <div id="bridgeStatus">Bridge: connecting...</div>
+    <div id="subtitle">Waiting for CLI messages...</div>
+  </div>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { VRMLoaderPlugin, VRMUtils, VRMExpressionPresetName } from 'https://cdn.jsdelivr.net/npm/@pixiv/three-vrm@2.0.6/lib/three-vrm.module.js';
+
+// --------------------
+// GLOBALS
+// --------------------
+let scene, camera, renderer, controls;
+let vrm;
+const clock = new THREE.Clock();
+const TARGET_FPS =  /Mobi|Android/i.test(navigator.userAgent) ? 30 : 45;
+const FRAME_DURATION = 1 / TARGET_FPS;
+let lastFrameTime = 0;
+
+// Blink state
+let blinkTimer = 0;
+let nextBlinkTime = 2;
+let isBlinking = false;
+let blinkProgress = 0;
+
+// Idle animation state
+let idleTime = 0;
+
+// Chat bridge + lip sync state
+const statusEl = document.getElementById('bridgeStatus');
+const subtitleEl = document.getElementById('subtitle');
+let ws;
+let speaking = false;
+let mouthOpen = 0;
+let mouthTarget = 0;
+let userActivatedAudio = false;
+const assistantAudio = new Audio();
+assistantAudio.preload = 'auto';
+let audioContext = null;
+let analyser = null;
+let timeData = null;
+let synthSpeaking = false;
+let synthPulseTimer = 0;
+let pendingSpeechText = '';
+let waitingForEdgeFallback = false;
+let edgeFallbackTimer = null;
+let lastAssistantText = '';
+
+const tmpCamLocal = new THREE.Vector3();
+
+const PREFER_FAST_VOICE = false;
+
+// --------------------
+// INIT SCENE
+// --------------------
+function init() {
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0xeeeeee);
+
+  camera = new THREE.PerspectiveCamera(30, innerWidth / innerHeight, 0.1, 100);
+  camera.position.set(0, 1.4, 2.5);
+
+  renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+  document.body.appendChild(renderer.domElement);
+
+  // Orbit controls for camera
+  controls = new OrbitControls(camera, renderer.domElement);
+  controls.target.set(0, 1.0, 0);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.05;
+  controls.update();
+
+  // Lighting - bright to show original model colors
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  
+  // Strong ambient light for even illumination
+  scene.add(new THREE.AmbientLight(0xffffff, 1.1));
+  
+  // Main light from front
+scene.add(new THREE.AmbientLight(0xffffff, 1.2));
+
+const light = new THREE.DirectionalLight(0xffffff, 0.6);
+light.position.set(0, 1, 1);
+scene.add(light);
+
+
+  // Handle resize
+  window.addEventListener('resize', onResize);
+}
+
+function onResize() {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+}
+
+function setBridgeStatus(text) {
+  statusEl.textContent = `Bridge: ${text}`;
+}
+
+function connectBridge() {
+  const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${protocol}://${location.host}/ws`);
+
+  ws.addEventListener('open', () => setBridgeStatus('connected'));
+  ws.addEventListener('close', () => {
+    setBridgeStatus('reconnecting...');
+    setTimeout(connectBridge, 1200);
+  });
+  ws.addEventListener('error', () => setBridgeStatus('error'));
+
+  ws.addEventListener('message', (event) => {
+    let data;
+    try {
+      data = JSON.parse(event.data);
+    } catch (_error) {
+      return;
+    }
+
+    if (data.type !== 'chat') return;
+
+    const role = data.role || 'assistant';
+    const eventType = data.event || 'chat';
+    const text = String(data.text || '').trim();
+    if (!text) return;
+
+    if (eventType === 'chat') {
+      const label = role === 'user' ? 'You' : 'Sana';
+      subtitleEl.textContent = `${label}: ${text}`;
+
+      if (role === 'assistant' && PREFER_FAST_VOICE) {
+        const started = speakTextFast(text);
+        waitingForEdgeFallback = !started;
+      } else if (role === 'assistant') {
+        lastAssistantText = text;
+        waitingForEdgeFallback = true;
+
+        if (edgeFallbackTimer) {
+          clearTimeout(edgeFallbackTimer);
+        }
+
+        // Edge is primary, but never stay silent if Edge fails.
+        edgeFallbackTimer = setTimeout(() => {
+          const audioSpeaking = !assistantAudio.paused && !assistantAudio.ended;
+          if (waitingForEdgeFallback && !audioSpeaking && !synthSpeaking) {
+            const started = speakTextFast(lastAssistantText);
+            waitingForEdgeFallback = !started;
+            if (started) {
+              setBridgeStatus('edge slow/unavailable, using fallback voice');
+            }
+          }
+        }, 1800);
+      }
+    }
+
+    if (role === 'assistant' && eventType === 'audio') {
+      const hasAudio = typeof data.audio_url === 'string' && data.audio_url.length > 0;
+      const shouldPlayEdge = !PREFER_FAST_VOICE || waitingForEdgeFallback || !('speechSynthesis' in window);
+
+      if (hasAudio && shouldPlayEdge) {
+        waitingForEdgeFallback = false;
+        if (edgeFallbackTimer) {
+          clearTimeout(edgeFallbackTimer);
+          edgeFallbackTimer = null;
+        }
+        playAssistantAudio(data.audio_url);
+      } else if (!hasAudio) {
+        setBridgeStatus('assistant audio missing');
+      }
+    }
+  });
+}
+
+function setupAudioAnalyser() {
+  if (audioContext || !userActivatedAudio) return;
+
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  if (!AudioCtx) return;
+
+  audioContext = new AudioCtx();
+  const source = audioContext.createMediaElementSource(assistantAudio);
+  analyser = audioContext.createAnalyser();
+  analyser.fftSize = 256;
+  analyser.smoothingTimeConstant = 0.45;
+  timeData = new Uint8Array(analyser.fftSize);
+
+  source.connect(analyser);
+  analyser.connect(audioContext.destination);
+}
+
+function cleanForSpeech(text) {
+  return String(text)
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/`([^`]*)`/g, '$1')
+    .replace(/\[([^\]]+)\]\(([^\)]+)\)/g, '$1')
+    .replace(/https?:\/\/\S+/g, ' ')
+    .replace(/[#*_~>|\\]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function speakTextFast(text) {
+  if (!('speechSynthesis' in window)) return false;
+  if (!userActivatedAudio) {
+    pendingSpeechText = text;
+    setBridgeStatus('tap/click once to enable audio');
+    return false;
+  }
+
+  const cleanText = cleanForSpeech(text);
+  if (!cleanText) return false;
+
+  window.speechSynthesis.cancel();
+  const utterance = new SpeechSynthesisUtterance(cleanText);
+  utterance.rate = 1.05;
+  utterance.pitch = 1.0;
+  utterance.volume = 1.0;
+
+  utterance.onstart = () => {
+    synthSpeaking = true;
+    synthPulseTimer = 0;
+    waitingForEdgeFallback = false;
+  };
+
+  utterance.onend = () => {
+    synthSpeaking = false;
+  };
+
+  utterance.onerror = () => {
+    synthSpeaking = false;
+    waitingForEdgeFallback = true;
+    setBridgeStatus('fast voice failed, waiting edge audio');
+  };
+
+  window.speechSynthesis.speak(utterance);
+  return true;
+}
+
+function flushPendingSpeech() {
+  if (!pendingSpeechText) return;
+  const queued = pendingSpeechText;
+  pendingSpeechText = '';
+  const started = speakTextFast(queued);
+  waitingForEdgeFallback = !started;
+}
+
+function playAssistantAudio(audioUrl) {
+  const normalized = audioUrl.startsWith('/') ? audioUrl : `/${audioUrl}`;
+  const cacheBusted = `${normalized}${normalized.includes('?') ? '&' : '?'}t=${Date.now()}`;
+
+  assistantAudio.pause();
+  assistantAudio.currentTime = 0;
+  assistantAudio.src = cacheBusted;
+
+  if (!userActivatedAudio) {
+    setBridgeStatus('tap/click once to enable audio');
+    return;
+  }
+
+  setupAudioAnalyser();
+  if (audioContext && audioContext.state === 'suspended') {
+    audioContext.resume().catch(() => {});
+  }
+
+  assistantAudio.play().then(() => {
+    speaking = true;
+    setBridgeStatus('connected');
+  }).catch(() => {
+    setBridgeStatus('audio blocked by browser');
+  });
+}
+
+function setMouthShape(openValue) {
+  if (!vrm || !vrm.expressionManager) return;
+
+  const open = THREE.MathUtils.clamp(openValue, 0, 1);
+  vrm.expressionManager.setValue(VRMExpressionPresetName.Aa, open);
+  vrm.expressionManager.setValue(VRMExpressionPresetName.Oh, open * 0.35);
+  vrm.expressionManager.setValue(VRMExpressionPresetName.Ih, open * 0.2);
+}
+
+
+assistantAudio.addEventListener('ended', () => {
+  speaking = false;
+  mouthTarget = 0;
+});
+
+assistantAudio.addEventListener('pause', () => {
+  if (assistantAudio.ended) {
+    speaking = false;
+    mouthTarget = 0;
+  }
+});
+
+function updateLipSync(delta) {
+  const audioSpeaking = !assistantAudio.paused && !assistantAudio.ended && assistantAudio.currentTime > 0;
+
+  if (audioSpeaking && analyser && timeData) {
+    analyser.getByteTimeDomainData(timeData);
+
+    let sumSq = 0;
+    for (let i = 0; i < timeData.length; i++) {
+      const centered = (timeData[i] - 128) / 128;
+      sumSq += centered * centered;
+    }
+
+    const rms = Math.sqrt(sumSq / timeData.length);
+    const normalized = THREE.MathUtils.clamp(rms * 3.2, 0, 1);
+    mouthTarget = Math.max(0.03, normalized);
+    speaking = true;
+  } else if (synthSpeaking) {
+    synthPulseTimer += delta;
+    const pulse = 0.25 + Math.abs(Math.sin(synthPulseTimer * 18.0)) * 0.6;
+    mouthTarget = pulse;
+    speaking = true;
+  } else {
+    speaking = false;
+    mouthTarget = 0;
+  }
+
+  const smooth = mouthTarget > mouthOpen ? 0.55 : 0.35;
+  mouthOpen = THREE.MathUtils.lerp(mouthOpen, mouthTarget, smooth);
+  setMouthShape(mouthOpen);
+}
+
+// --------------------
+// LOAD VRM MODEL
+// --------------------
+function loadVRM() {
+  const loader = new GLTFLoader();
+  loader.register(p => new VRMLoaderPlugin(p));
+
+  loader.load(
+    './ai_v2.vrm',  // Change this to your 3rd model filename
+    (gltf) => {
+      vrm = gltf.userData.vrm;
+
+      VRMUtils.removeUnnecessaryVertices(vrm.scene);
+      VRMUtils.removeUnnecessaryJoints(vrm.scene);
+
+      // VRM faces -Z, rotate 180° to face camera
+      vrm.scene.rotation.y = Math.PI;
+
+      scene.add(vrm.scene);
+
+      console.log("✅ VRM loaded:", vrm);
+
+    // --- ENABLE JIGGLE PHYSICS ---
+// ===============================
+// 🫨 CHEST JIGGLE PHYSICS
+// ===============================
+if (vrm.springBoneManager) {
+
+  vrm.springBoneManager.springBones.forEach((spring) => {
+
+    const name = spring.joint?.bone?.name?.toLowerCase() || "";
+
+    // 🎯 target chest / bust bones
+    if (
+      name.includes("bust") ||
+      name.includes("chest") ||
+      name.includes("breast")
+    ) {
+      spring.stiffness = 0.12;     // ⬇ softer = more jiggle
+      spring.gravityPower = 0.35;  // ⬆ bounce
+      spring.dragForce = 0.45;     // ⬇ slower damping
+      spring.hitRadius = 0.03;     // ⬆ soft collision
+
+      console.log("🫨 Chest jiggle enabled on:", name);
+    }
+  });
+}
+
+
+    },
+    (progress) => {
+      if (progress.total > 0) {
+        console.log("Loading VRM:", ((progress.loaded / progress.total) * 100).toFixed(1) + "%");
+      }
+    },
+    (error) => console.error("❌ VRM load error:", error)
+  );
+}
+
+// --------------------
+// --------------------
+// EYE BLINK ANIMATION
+// --------------------
+function updateBlink(delta) {
+  if (!vrm || !vrm.expressionManager) return;
+
+  blinkTimer += delta;
+
+  if (!isBlinking) {
+    // Wait for next blink
+    if (blinkTimer >= nextBlinkTime) {
+      isBlinking = true;
+      blinkProgress = 0;
+      blinkTimer = 0;
+      // Random interval between blinks (2-5 seconds)
+      nextBlinkTime = 2 + Math.random() * 3;
+    }
+  } else {
+    // Perform blink animation
+    blinkProgress += delta * 10; // Speed of blink
+    
+    if (blinkProgress < 1) {
+      // Closing eyes
+      vrm.expressionManager.setValue(VRMExpressionPresetName.Blink, blinkProgress);
+    } else if (blinkProgress < 2) {
+      // Opening eyes
+      vrm.expressionManager.setValue(VRMExpressionPresetName.Blink, 2 - blinkProgress);
+    } else {
+      // Blink complete
+      vrm.expressionManager.setValue(VRMExpressionPresetName.Blink, 0);
+      isBlinking = false;
+    }
+  }
+}
+
+
+// --------------------
+// IDLE POSE ANIMATION (breathing + subtle sway)
+// --------------------
+// Camera-follow head movement
+function updateHeadLookAtCamera(head) {
+  if (!head || !head.parent) return;
+
+  tmpCamLocal.copy(camera.position);
+  head.parent.worldToLocal(tmpCamLocal);
+
+  const dx = tmpCamLocal.x - head.position.x;
+  const dy = tmpCamLocal.y - head.position.y;
+  const dz = tmpCamLocal.z - head.position.z;
+  const distXZ = Math.hypot(dx, dz);
+
+  const targetYaw = THREE.MathUtils.clamp(Math.atan2(dx, dz), -0.45, 0.45);
+  const targetPitch = THREE.MathUtils.clamp(-Math.atan2(dy, Math.max(distXZ, 0.001)) * 0.9, -0.22, 0.22);
+
+  // Tiny natural motion while still following the camera.
+  const microYaw = Math.sin(idleTime * 0.9) * 0.035;
+  const microPitch = Math.sin(idleTime * 1.1 + 1.2) * 0.02;
+
+  head.rotation.y = THREE.MathUtils.lerp(head.rotation.y, targetYaw + microYaw, 0.14);
+  head.rotation.x = THREE.MathUtils.lerp(head.rotation.x, targetPitch + microPitch, 0.14);
+}
+
+function updateIdleAnimation(delta) {
+  if (!vrm) return;
+
+  idleTime += delta;
+
+  // Get bones
+  const hips = vrm.humanoid.getNormalizedBoneNode('hips');
+  const spine = vrm.humanoid.getNormalizedBoneNode('spine');
+  const chest = vrm.humanoid.getNormalizedBoneNode('chest');
+  const upperChest = vrm.humanoid.getNormalizedBoneNode('upperChest');
+  const head = vrm.humanoid.getNormalizedBoneNode('head');
+  const leftUpperArm = vrm.humanoid.getNormalizedBoneNode('leftUpperArm');
+  const rightUpperArm = vrm.humanoid.getNormalizedBoneNode('rightUpperArm');
+
+  // Breathing cycle (inhale/exhale ~4 seconds)
+  const breathCycle = Math.sin(idleTime * 1.5);
+  
+  // Chest breathing
+  if (chest) {
+    chest.rotation.x = breathCycle * 0.02;
+  }
+  if (upperChest) {
+    upperChest.rotation.x = breathCycle * 0.015;
+  }
+  if (spine) {
+    spine.rotation.x = breathCycle * 0.01;
+  }
+
+  // Subtle body sway (slower)
+  const swayCycle = Math.sin(idleTime * 0.5);
+  if (hips) {
+    hips.rotation.y = swayCycle * 0.01;
+  }
+  if (spine) {
+    spine.rotation.z = swayCycle * 0.005;
+  }
+
+  if (head) {
+    updateHeadLookAtCamera(head);
+  }
+
+
+  // Keep arms down with very subtle movement
+  if (leftUpperArm) {
+    leftUpperArm.rotation.z = -1.45 + swayCycle * 0.01;  // Arms down at sides
+    leftUpperArm.rotation.x = 0.05;
+  }
+  if (rightUpperArm) {
+    rightUpperArm.rotation.z = 1.45 - swayCycle * 0.01; // Arms down at sides  
+    rightUpperArm.rotation.x = 0.05;
+  }
+}
+// Tail animation
+let tailTime = 0;
+let tailBones = []; // Cache tail bones after finding them
+
+function findTailBones() {
+  if (!vrm || tailBones.length > 0) return;
+  
+  // Search the entire scene for bones with "tail" or "foxtail" in the name
+  // Exclude "end" bones which are just markers
+  vrm.scene.traverse((obj) => {
+    if (obj.isBone && 
+        obj.name.toLowerCase().includes('tail') && 
+        !obj.name.toLowerCase().includes('end')) {
+      tailBones.push(obj);
+      console.log('🦊 Found tail bone:', obj.name);
+    }
+  });
+  
+  // Sort by name to ensure proper order (tail1, tail2, tail3, etc.)
+  tailBones.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+  
+  if (tailBones.length > 0) {
+    console.log(`✅ Total tail bones found: ${tailBones.length}`);
+  } else {
+    // If no bones found, try finding ALL bones and log them
+    console.log('❌ No tail bones found. Listing all bones:');
+    vrm.scene.traverse((obj) => {
+      if (obj.isBone) {
+        console.log('  Bone:', obj.name);
+      }
+    });
+  }
+  
+  // Disable spring bones for tail if they exist
+  if (vrm.springBoneManager) {
+    console.log('🔧 Spring bone manager found, tail may have physics');
+  }
+}
+
+
+
+
+// --------------------
+// ANIMATION LOOP (60 FPS)
+// --------------------
+function animate(currentTime) {
+  requestAnimationFrame(animate);
+
+  // Convert to seconds
+  const time = currentTime / 1000;
+  const elapsed = time - lastFrameTime;
+
+  // Limit to target FPS
+  if (elapsed < FRAME_DURATION) return;
+
+  lastFrameTime = time - (elapsed % FRAME_DURATION);
+
+  const delta = clock.getDelta();
+
+  // Update VRM-specific features (expressions, spring bones)
+  if (vrm) {
+    updateIdleAnimation(delta);
+    updateBlink(delta);
+    updateLipSync(delta);
+    vrm.update(delta);  
+  }
+
+  // Update controls
+  controls.update();
+
+  // Render
+  renderer.render(scene, camera);
+}
+
+// --------------------
+// START
+// --------------------
+init();
+loadVRM();
+connectBridge();
+requestAnimationFrame(animate);
+
+// --------------------
+// AUTO FULLSCREEN (works on mobile too)
+// --------------------
+function enterFullscreen() {
+  const elem = document.documentElement;
+  
+  if (elem.requestFullscreen) {
+    elem.requestFullscreen();
+  } else if (elem.webkitRequestFullscreen) { // Safari
+    elem.webkitRequestFullscreen();
+  } else if (elem.msRequestFullscreen) { // IE/Edge
+    elem.msRequestFullscreen();
+  } else if (elem.mozRequestFullScreen) { // Firefox
+    elem.mozRequestFullScreen();
+  }
+}
+
+// Fullscreen on first user interaction (required by browsers)
+function onFirstInteraction() {
+  userActivatedAudio = true;
+  setupAudioAnalyser();
+  if (audioContext && audioContext.state === 'suspended') {
+    audioContext.resume().catch(() => {});
+  }
+  flushPendingSpeech();
+  enterFullscreen();
+  // Remove listeners after first interaction
+  document.removeEventListener('click', onFirstInteraction);
+  document.removeEventListener('touchstart', onFirstInteraction);
+  document.removeEventListener('keydown', onFirstInteraction);
+}
+
+// Listen for user interaction to trigger fullscreen
+document.addEventListener('click', onFirstInteraction);
+document.addEventListener('touchstart', onFirstInteraction);
+document.addEventListener('keydown', onFirstInteraction);
+
+// Also try on page load (may work in some contexts)
+window.addEventListener('load', () => {
+  // Show instruction overlay
+  const overlay = document.createElement('div');
+  overlay.id = 'fullscreen-hint';
+  overlay.innerHTML = '👆 Tap or click to enter fullscreen';
+  overlay.style.cssText = `
+    position: fixed;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(0,0,0,0.7);
+    color: white;
+    padding: 12px 24px;
+    border-radius: 8px;
+    font-family: sans-serif;
+    font-size: 14px;
+    z-index: 1000;
+    pointer-events: none;
+  `;
+  document.body.appendChild(overlay);
+  
+  // Hide overlay after fullscreen or timeout
+  setTimeout(() => {
+    if (overlay.parentNode) overlay.remove();
+  }, 5000);
+  
+  document.addEventListener('fullscreenchange', () => {
+    if (document.fullscreenElement && overlay.parentNode) {
+      overlay.remove();
+    }
+  });
+});
+
+// Exit fullscreen with ESC (already built-in) or double-tap
+let lastTap = 0;
+document.addEventListener('touchend', (e) => {
+  const now = Date.now();
+  if (now - lastTap < 300) {
+    if (document.fullscreenElement) {
+      document.exitFullscreen();
+    } else {
+      enterFullscreen();
+    }
+  }
+  lastTap = now;
+});
+
+console.log("🎮 VRM Viewer initialized - Target: 60 FPS");
+</script>
+
+</body>
+</html>
