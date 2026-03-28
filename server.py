@@ -60,6 +60,7 @@ async def emit_handler(request: web.Request) -> web.Response:
 	text = str(data.get("text", "")).strip()
 	audio_url = data.get("audio_url")
 	event = str(data.get("event", "chat")).strip().lower()
+	message_id = str(data.get("message_id", "")).strip()
 
 	if role not in {"user", "assistant", "system"}:
 		return web.json_response({"ok": False, "error": "Invalid role"}, status=400)
@@ -67,12 +68,14 @@ async def emit_handler(request: web.Request) -> web.Response:
 	if not text:
 		return web.json_response({"ok": False, "error": "Text is required"}, status=400)
 
-	if event not in {"chat", "audio"}:
+	if event not in {"chat", "audio", "chat_audio"}:
 		return web.json_response({"ok": False, "error": "Invalid event"}, status=400)
 
 	payload = {"type": "chat", "role": role, "text": text, "event": event}
 	if isinstance(audio_url, str) and audio_url.strip():
 		payload["audio_url"] = audio_url.strip()
+	if message_id:
+		payload["message_id"] = message_id
 	delivered = await broadcast(payload)
 	return web.json_response({"ok": True, "clients": delivered})
 

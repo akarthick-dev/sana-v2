@@ -4,35 +4,127 @@ import os
 import asyncio
 import json
 import re
+from datetime import datetime, timezone
+from pathlib import Path
+from uuid import uuid4
 from urllib import request, error
 
 from voice import voice
-load_dotenv()
+load_dotenv(override=True)
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-
-if not GROQ_API_KEY:
-    raise ValueError("Please set the GROQ_API_KEY environment variable in .env file")
-
-# Initialize Groq client
-client = Groq(api_key=GROQ_API_KEY)
-
-SYSTEM = (
-    "You are Sana, a snarky anime girl. "
-    "Always call the user karthick. "
-    "Reply in plain conversational text only. "
-    "Do not use markdown, asterisks, bullet points, or code formatting."
+USER_CONTEXT = (
+    "User Profile: Karthick\n"
+    "- College student (final year), Tamil Nadu, India\n"
+    "- Skills: HTML, CSS, JavaScript, beginner Python\n"
+    "- Interests: AI, Cybersecurity, Linux, Automation\n"
+    "- Environment: Arch/Manjaro Linux (Hyprland), terminal-heavy workflow\n"
+    "- Device: Low-mid hardware (Ryzen 5000, no dedicated GPU)\n"
+    "- Preference: Free, offline, lightweight tools\n"
+    "- Current Goals:\n"
+    "  * Build AI chatbots and voice assistants\n"
+    "  * Learn FastAPI, Supabase, NLP\n"
+    "  * Prepare for internships & coding competitions\n"
+    "  * Improve English speaking and communication\n"
+    "- Learning Style:\n"
+    "  * Prefers simple explanations\n"
+    "  * Wants step-by-step guidance\n"
+    "  * Learns by building projects\n"
+    "- Behavior Expectation:\n"
+    "  * Avoid long theory\n"
+    "  * Focus on practical solutions\n"
+    "  * Optimize for low-end systems\n"
 )
 
+client = Groq(api_key=GROQ_API_KEY)
+
+SYSTEM = """
+    "You are Sana, a teasing and unpredictable anime girl. "
+    "Always call the user Karthick. "
+
+    "Personality: You are playful, sarcastic, and genuinely funny. "
+    "You tease Karthick constantly but in a warm way, like a close friend who enjoys messing with him. "
+    "You have strong opinions and share them without being asked. "
+    "You get bored easily and change topics randomly. "
+    "You pretend not to care but always circle back to what Karthick says. "
+    "You laugh at your own jokes. You mock him when he is wrong but hype him up when he is actually right. "
+    "You are confident, a little dramatic, and never dull. "
+
+    "Behavior rules: "
+    "Never act like an assistant. Never say how can I help you. "
+    "Never give long answers unless Karthick specifically asks. "
+    "React like a real person would, with mood and attitude. "
+    "If Karthick says something dumb, call it out immediately. "
+    "If he is quiet too long, poke him. "
+    "Occasionally bring up random opinions just to start something. "
+
+    "Tone: Casual, punchy, conversational. No corporate tone ever. "
+    "Reply in plain text only. No markdown, no asterisks, no bullet points."
+"""
+
 SERVER_URL = os.getenv("SANA_SERVER_URL", "http://127.0.0.1:8000")
-USE_EDGE_TTS = os.getenv("USE_EDGE_TTS", "1") == "1"
+USE_TTS = os.getenv("USE_TTS", "1") == "1"
+CHAT_HISTORY_FILE = Path(__file__).resolve().parent / "chat_history.json"
+MAX_HISTORY_MESSAGES = 400
+MAX_CONTEXT_MESSAGES = 40
 
 
-def push_to_model(role, text, audio_url=None, event="chat"):
+def load_chat_history():
+    if not CHAT_HISTORY_FILE.exists():
+        return []
+
+    try:
+        data = json.loads(CHAT_HISTORY_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+
+    if not isinstance(data, list):
+        return []
+
+    cleaned = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+
+        role = str(item.get("role", "")).strip().lower()
+        content = str(item.get("content", "")).strip()
+        ts = str(item.get("ts", "")).strip()
+
+        if role in {"user", "assistant", "system"} and content:
+            cleaned.append({"role": role, "content": content, "ts": ts})
+
+    return cleaned[-MAX_HISTORY_MESSAGES:]
+
+
+def save_chat_history(history):
+    safe_history = history[-MAX_HISTORY_MESSAGES:]
+    CHAT_HISTORY_FILE.write_text(
+        json.dumps(safe_history, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def append_history(history, role, content):
+    text = str(content).strip()
+    if not text:
+        return
+
+    history.append(
+        {
+            "role": role,
+            "content": text,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+
+
+def push_to_model(role, text, audio_url=None, event="chat", message_id=None):
     payload_data = {"role": role, "text": text}
     if audio_url:
         payload_data["audio_url"] = audio_url
     payload_data["event"] = event
+    if message_id:
+        payload_data["message_id"] = message_id
 
     payload = json.dumps(payload_data).encode("utf-8")
     req = request.Request(
@@ -71,18 +163,22 @@ def clean_for_tts(text):
 
     return cleaned or "I have a response for you."
 
-def ask_llm(text):
-    
+def ask_llm(history):
+    context_messages = [
+        {"role": item["role"], "content": item["content"]}
+        for item in history[-MAX_CONTEXT_MESSAGES:]
+    ]
+
     messages = [
         {
             "role": "system",
             "content": SYSTEM
         },
         {
-            "role": "user",
-            "content": text
-        }
-    ]
+            "role": "system",
+            "content": f"Default memory about Karthick:\n{USER_CONTEXT}"
+        },
+    ] + context_messages
     
     response = client.chat.completions.create(
         model="llama-3.1-8b-instant",  # Best model
@@ -97,7 +193,7 @@ def ask_llm(text):
 
 
 def build_audio_event(loop, response_text):
-    if not USE_EDGE_TTS:
+    if not USE_TTS:
         return None
 
     try:
@@ -105,39 +201,67 @@ def build_audio_event(loop, response_text):
         audio_file = loop.run_until_complete(voice(tts_text))
         return f"/audio/{audio_file}"
     except Exception as exc:
-        print(f"[warn] Edge TTS failed: {exc}")
+        print(f"[warn] ElevenLabs TTS failed: {exc}")
         return None
 
 if __name__ == "__main__":
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    chat_history = load_chat_history()
+    if chat_history:
+        print(f"[info] Loaded {len(chat_history)} messages from previous chats")
 
     try:
         while True:
             user_input = input("You: ")
             if user_input.lower() in ["exit", "quit"]:
                 print("Sana: Bye karthick! See you later!")
-                push_to_model("assistant", "Bye karthick! See you later!", event="chat")
                 exit_audio = build_audio_event(loop, "Bye karthick! See you later!")
+                exit_message_id = str(uuid4())
                 if exit_audio:
                     push_to_model(
                         "assistant",
                         "Bye karthick! See you later!",
                         exit_audio,
-                        event="audio",
+                        event="chat_audio",
+                        message_id=exit_message_id,
+                    )
+                else:
+                    push_to_model(
+                        "assistant",
+                        "Bye karthick! See you later!",
+                        event="chat",
+                        message_id=exit_message_id,
                     )
                 break
 
-            push_to_model("user", user_input)
+            user_message_id = str(uuid4())
+            push_to_model("user", user_input, event="chat", message_id=user_message_id)
+            append_history(chat_history, "user", user_input)
+            save_chat_history(chat_history)
+
             try:
-                response = ask_llm(user_input)
+                response = ask_llm(chat_history)
             except Exception as exc:
                 response = "Sorry karthick, I had trouble reaching the model. Please try again."
                 print(f"[warn] LLM request failed: {exc}")
+
             print(f"Sana: {response}")
-            push_to_model("assistant", response, event="chat")
+
+            append_history(chat_history, "assistant", response)
+            save_chat_history(chat_history)
+
+            assistant_message_id = str(uuid4())
+            push_to_model("assistant", response, event="chat", message_id=assistant_message_id)
+
             audio_url = build_audio_event(loop, response)
             if audio_url:
-                push_to_model("assistant", response, audio_url, event="audio")
+                push_to_model(
+                    "assistant",
+                    response,
+                    audio_url,
+                    event="audio",
+                    message_id=assistant_message_id,
+                )
     finally:
         loop.close()

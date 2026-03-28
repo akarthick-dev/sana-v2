@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+.env
+audio/*.mp3
+recorded.wav
+screen.png

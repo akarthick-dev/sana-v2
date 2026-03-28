@@ -76,6 +76,11 @@ let blinkProgress = 0;
 
 // Idle animation state
 let idleTime = 0;
+let lookShiftTimer = 0;
+let nextLookShiftTime = 2.4;
+let lookYawBias = 0;
+let lookPitchBias = 0;
+let lookRollBias = 0;
 
 // Chat bridge + lip sync state
 const statusEl = document.getElementById('bridgeStatus');
@@ -90,16 +95,10 @@ assistantAudio.preload = 'auto';
 let audioContext = null;
 let analyser = null;
 let timeData = null;
-let synthSpeaking = false;
-let synthPulseTimer = 0;
-let pendingSpeechText = '';
-let waitingForEdgeFallback = false;
-let edgeFallbackTimer = null;
-let lastAssistantText = '';
+let currentAssistantMessageId = '';
+const pendingAssistantById = new Map();
 
 const tmpCamLocal = new THREE.Vector3();
-
-const PREFER_FAST_VOICE = false;
 
 // --------------------
 // INIT SCENE
@@ -175,48 +174,30 @@ function connectBridge() {
     const role = data.role || 'assistant';
     const eventType = data.event || 'chat';
     const text = String(data.text || '').trim();
+    const messageId = String(data.message_id || '').trim();
     if (!text) return;
 
-    if (eventType === 'chat') {
+    if (eventType === 'chat' || eventType === 'chat_audio') {
       const label = role === 'user' ? 'You' : 'Sana';
       subtitleEl.textContent = `${label}: ${text}`;
 
-      if (role === 'assistant' && PREFER_FAST_VOICE) {
-        const started = speakTextFast(text);
-        waitingForEdgeFallback = !started;
-      } else if (role === 'assistant') {
-        lastAssistantText = text;
-        waitingForEdgeFallback = true;
-
-        if (edgeFallbackTimer) {
-          clearTimeout(edgeFallbackTimer);
-        }
-
-        // Edge is primary, but never stay silent if Edge fails.
-        edgeFallbackTimer = setTimeout(() => {
-          const audioSpeaking = !assistantAudio.paused && !assistantAudio.ended;
-          if (waitingForEdgeFallback && !audioSpeaking && !synthSpeaking) {
-            const started = speakTextFast(lastAssistantText);
-            waitingForEdgeFallback = !started;
-            if (started) {
-              setBridgeStatus('edge slow/unavailable, using fallback voice');
-            }
-          }
-        }, 1800);
+      if (role === 'assistant') {
+        const effectiveId = messageId || `assistant-${Date.now()}`;
+        currentAssistantMessageId = effectiveId;
+        pendingAssistantById.set(effectiveId, text);
       }
     }
 
-    if (role === 'assistant' && eventType === 'audio') {
+    if (role === 'assistant' && (eventType === 'audio' || eventType === 'chat_audio')) {
       const hasAudio = typeof data.audio_url === 'string' && data.audio_url.length > 0;
-      const shouldPlayEdge = !PREFER_FAST_VOICE || waitingForEdgeFallback || !('speechSynthesis' in window);
 
-      if (hasAudio && shouldPlayEdge) {
-        waitingForEdgeFallback = false;
-        if (edgeFallbackTimer) {
-          clearTimeout(edgeFallbackTimer);
-          edgeFallbackTimer = null;
+      if (hasAudio) {
+        const effectiveId = messageId || currentAssistantMessageId;
+        const syncedText = pendingAssistantById.get(effectiveId) || text;
+        if (syncedText) {
+          subtitleEl.textContent = `Sana: ${syncedText}`;
         }
-        playAssistantAudio(data.audio_url);
+        playAssistantAudio(data.audio_url, effectiveId);
       } else if (!hasAudio) {
         setBridgeStatus('assistant audio missing');
       }
@@ -241,63 +222,7 @@ function setupAudioAnalyser() {
   analyser.connect(audioContext.destination);
 }
 
-function cleanForSpeech(text) {
-  return String(text)
-    .replace(/```[\s\S]*?```/g, ' ')
-    .replace(/`([^`]*)`/g, '$1')
-    .replace(/\[([^\]]+)\]\(([^\)]+)\)/g, '$1')
-    .replace(/https?:\/\/\S+/g, ' ')
-    .replace(/[#*_~>|\\]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function speakTextFast(text) {
-  if (!('speechSynthesis' in window)) return false;
-  if (!userActivatedAudio) {
-    pendingSpeechText = text;
-    setBridgeStatus('tap/click once to enable audio');
-    return false;
-  }
-
-  const cleanText = cleanForSpeech(text);
-  if (!cleanText) return false;
-
-  window.speechSynthesis.cancel();
-  const utterance = new SpeechSynthesisUtterance(cleanText);
-  utterance.rate = 1.05;
-  utterance.pitch = 1.0;
-  utterance.volume = 1.0;
-
-  utterance.onstart = () => {
-    synthSpeaking = true;
-    synthPulseTimer = 0;
-    waitingForEdgeFallback = false;
-  };
-
-  utterance.onend = () => {
-    synthSpeaking = false;
-  };
-
-  utterance.onerror = () => {
-    synthSpeaking = false;
-    waitingForEdgeFallback = true;
-    setBridgeStatus('fast voice failed, waiting edge audio');
-  };
-
-  window.speechSynthesis.speak(utterance);
-  return true;
-}
-
-function flushPendingSpeech() {
-  if (!pendingSpeechText) return;
-  const queued = pendingSpeechText;
-  pendingSpeechText = '';
-  const started = speakTextFast(queued);
-  waitingForEdgeFallback = !started;
-}
-
-function playAssistantAudio(audioUrl) {
+function playAssistantAudio(audioUrl, messageId) {
   const normalized = audioUrl.startsWith('/') ? audioUrl : `/${audioUrl}`;
   const cacheBusted = `${normalized}${normalized.includes('?') ? '&' : '?'}t=${Date.now()}`;
 
@@ -317,6 +242,10 @@ function playAssistantAudio(audioUrl) {
 
   assistantAudio.play().then(() => {
     speaking = true;
+    if (messageId) {
+      currentAssistantMessageId = messageId;
+      pendingAssistantById.delete(messageId);
+    }
     setBridgeStatus('connected');
   }).catch(() => {
     setBridgeStatus('audio blocked by browser');
@@ -330,6 +259,17 @@ function setMouthShape(openValue) {
   vrm.expressionManager.setValue(VRMExpressionPresetName.Aa, open);
   vrm.expressionManager.setValue(VRMExpressionPresetName.Oh, open * 0.35);
   vrm.expressionManager.setValue(VRMExpressionPresetName.Ih, open * 0.2);
+}
+
+function setTalkingFace(talkAmount) {
+  if (!vrm || !vrm.expressionManager) return;
+
+  const amount = THREE.MathUtils.clamp(talkAmount, 0, 1);
+  const joyPreset = VRMExpressionPresetName.Joy || 'joy';
+  const funPreset = VRMExpressionPresetName.Fun || 'fun';
+
+  vrm.expressionManager.setValue(joyPreset, amount * 0.22);
+  vrm.expressionManager.setValue(funPreset, amount * 0.14);
 }
 
 
@@ -361,11 +301,6 @@ function updateLipSync(delta) {
     const normalized = THREE.MathUtils.clamp(rms * 3.2, 0, 1);
     mouthTarget = Math.max(0.03, normalized);
     speaking = true;
-  } else if (synthSpeaking) {
-    synthPulseTimer += delta;
-    const pulse = 0.25 + Math.abs(Math.sin(synthPulseTimer * 18.0)) * 0.6;
-    mouthTarget = pulse;
-    speaking = true;
   } else {
     speaking = false;
     mouthTarget = 0;
@@ -374,6 +309,7 @@ function updateLipSync(delta) {
   const smooth = mouthTarget > mouthOpen ? 0.55 : 0.35;
   mouthOpen = THREE.MathUtils.lerp(mouthOpen, mouthTarget, smooth);
   setMouthShape(mouthOpen);
+  setTalkingFace(mouthOpen);
 }
 
 // --------------------
@@ -475,9 +411,18 @@ function updateBlink(delta) {
 // --------------------
 // IDLE POSE ANIMATION (breathing + subtle sway)
 // --------------------
-// Camera-follow head movement
-function updateHeadLookAtCamera(head) {
+// Camera-follow head movement + autonomous idle glances.
+function updateHeadLookAtCamera(head, neck, delta) {
   if (!head || !head.parent) return;
+
+  lookShiftTimer += delta;
+  if (lookShiftTimer >= nextLookShiftTime) {
+    lookShiftTimer = 0;
+    nextLookShiftTime = 2.0 + Math.random() * 2.8;
+    lookYawBias = THREE.MathUtils.randFloat(-0.18, 0.18);
+    lookPitchBias = THREE.MathUtils.randFloat(-0.07, 0.08);
+    lookRollBias = THREE.MathUtils.randFloat(-0.06, 0.06);
+  }
 
   tmpCamLocal.copy(camera.position);
   head.parent.worldToLocal(tmpCamLocal);
@@ -487,15 +432,28 @@ function updateHeadLookAtCamera(head) {
   const dz = tmpCamLocal.z - head.position.z;
   const distXZ = Math.hypot(dx, dz);
 
-  const targetYaw = THREE.MathUtils.clamp(Math.atan2(dx, dz), -0.45, 0.45);
-  const targetPitch = THREE.MathUtils.clamp(-Math.atan2(dy, Math.max(distXZ, 0.001)) * 0.9, -0.22, 0.22);
+  const cameraYaw = THREE.MathUtils.clamp(Math.atan2(dx, dz), -0.45, 0.45);
+  const cameraPitch = THREE.MathUtils.clamp(-Math.atan2(dy, Math.max(distXZ, 0.001)) * 0.9, -0.22, 0.22);
 
   // Tiny natural motion while still following the camera.
-  const microYaw = Math.sin(idleTime * 0.9) * 0.035;
-  const microPitch = Math.sin(idleTime * 1.1 + 1.2) * 0.02;
+  const microYaw = Math.sin(idleTime * 0.9) * 0.03;
+  const microPitch = Math.sin(idleTime * 1.1 + 1.2) * 0.018;
+  const microRoll = Math.sin(idleTime * 0.65 + 0.7) * 0.018;
+  const talkNod = speaking ? Math.sin(idleTime * 18.0) * 0.012 : 0;
 
-  head.rotation.y = THREE.MathUtils.lerp(head.rotation.y, targetYaw + microYaw, 0.14);
-  head.rotation.x = THREE.MathUtils.lerp(head.rotation.x, targetPitch + microPitch, 0.14);
+  const targetYaw = THREE.MathUtils.clamp(cameraYaw * 0.72 + lookYawBias + microYaw, -0.55, 0.55);
+  const targetPitch = THREE.MathUtils.clamp(cameraPitch * 0.68 + lookPitchBias + microPitch + talkNod, -0.30, 0.30);
+  const targetRoll = THREE.MathUtils.clamp(lookRollBias + microRoll, -0.14, 0.14);
+
+  if (neck) {
+    neck.rotation.y = THREE.MathUtils.lerp(neck.rotation.y, targetYaw * 0.35, 0.10);
+    neck.rotation.x = THREE.MathUtils.lerp(neck.rotation.x, targetPitch * 0.28, 0.10);
+    neck.rotation.z = THREE.MathUtils.lerp(neck.rotation.z, targetRoll * 0.40, 0.10);
+  }
+
+  head.rotation.y = THREE.MathUtils.lerp(head.rotation.y, targetYaw, 0.16);
+  head.rotation.x = THREE.MathUtils.lerp(head.rotation.x, targetPitch, 0.16);
+  head.rotation.z = THREE.MathUtils.lerp(head.rotation.z, targetRoll, 0.14);
 }
 
 function updateIdleAnimation(delta) {
@@ -508,6 +466,7 @@ function updateIdleAnimation(delta) {
   const spine = vrm.humanoid.getNormalizedBoneNode('spine');
   const chest = vrm.humanoid.getNormalizedBoneNode('chest');
   const upperChest = vrm.humanoid.getNormalizedBoneNode('upperChest');
+  const neck = vrm.humanoid.getNormalizedBoneNode('neck');
   const head = vrm.humanoid.getNormalizedBoneNode('head');
   const leftUpperArm = vrm.humanoid.getNormalizedBoneNode('leftUpperArm');
   const rightUpperArm = vrm.humanoid.getNormalizedBoneNode('rightUpperArm');
@@ -536,7 +495,7 @@ function updateIdleAnimation(delta) {
   }
 
   if (head) {
-    updateHeadLookAtCamera(head);
+    updateHeadLookAtCamera(head, neck, delta);
   }
 
 
@@ -656,7 +615,6 @@ function onFirstInteraction() {
   if (audioContext && audioContext.state === 'suspended') {
     audioContext.resume().catch(() => {});
   }
-  flushPendingSpeech();
   enterFullscreen();
   // Remove listeners after first interaction
   document.removeEventListener('click', onFirstInteraction);
