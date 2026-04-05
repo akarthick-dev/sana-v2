@@ -81,6 +81,7 @@ let nextLookShiftTime = 2.4;
 let lookYawBias = 0;
 let lookPitchBias = 0;
 let lookRollBias = 0;
+let speakingFocus = 0;
 
 // Chat bridge + lip sync state
 const statusEl = document.getElementById('bridgeStatus');
@@ -89,6 +90,11 @@ let ws;
 let speaking = false;
 let mouthOpen = 0;
 let mouthTarget = 0;
+let browShiftTimer = 0;
+let nextBrowShiftTime = 1.6;
+let browRandomTarget = 0;
+let browRandom = 0;
+let browTalk = 0;
 let userActivatedAudio = false;
 const assistantAudio = new Audio();
 assistantAudio.preload = 'auto';
@@ -97,6 +103,45 @@ let analyser = null;
 let timeData = null;
 let currentAssistantMessageId = '';
 const pendingAssistantById = new Map();
+
+const emotionState = {
+  target: 'neutral',
+  targetIntensity: 0,
+  intensity: 0,
+  holdUntilMs: 0,
+  current: {
+    joy: 0,
+    fun: 0,
+    angry: 0,
+    sorrow: 0,
+    surprised: 0,
+    relaxed: 0,
+  }
+};
+
+const EMOTION_PATTERNS = {
+  joy: [
+    /\b(haha|lol|great|awesome|nice|love|happy|cool|yay|good|perfect)\b/i,
+    /!{2,}/,
+    /😊|😄|😁|😂|❤️/
+  ],
+  angry: [
+    /\b(angry|mad|annoy|irritat|stupid|wtf|damn|hate|fuck|shit)\b/i,
+    /\b(not fair|nonsense|useless)\b/i
+  ],
+  sorrow: [
+    /\b(sad|upset|depress|lonely|bad day|sorry|hurt|cry|tired)\b/i,
+    /😢|😭/
+  ],
+  surprised: [
+    /\b(wow|omg|seriously|no way|unexpected|what)\b/i,
+    /\?{2,}/
+  ],
+  relaxed: [
+    /\b(okay|fine|alright|sure|calm|chill|easy)\b/i,
+    /\.\.\./
+  ],
+};
 
 const tmpCamLocal = new THREE.Vector3();
 
@@ -148,6 +193,108 @@ function onResize() {
 
 function setBridgeStatus(text) {
   statusEl.textContent = `Bridge: ${text}`;
+}
+
+function inferEmotionFromText(text, role, eventType) {
+  const cleaned = String(text || '').trim();
+  if (!cleaned) {
+    return { emotion: 'neutral', intensity: 0 };
+  }
+
+  const scores = {
+    joy: 0,
+    angry: 0,
+    sorrow: 0,
+    surprised: 0,
+    relaxed: 0,
+  };
+
+  for (const [emotion, patterns] of Object.entries(EMOTION_PATTERNS)) {
+    for (const pattern of patterns) {
+      if (pattern.test(cleaned)) scores[emotion] += 1;
+    }
+  }
+
+  let winner = 'neutral';
+  let bestScore = 0;
+  for (const [emotion, score] of Object.entries(scores)) {
+    if (score > bestScore) {
+      bestScore = score;
+      winner = emotion;
+    }
+  }
+
+  if (bestScore === 0) {
+    return { emotion: 'neutral', intensity: 0.12 };
+  }
+
+  let intensity = THREE.MathUtils.clamp(0.28 + bestScore * 0.24, 0.25, 1.0);
+  if (role === 'user') intensity *= 0.85;
+  if (role === 'assistant' && (eventType === 'audio' || eventType === 'chat_audio')) intensity += 0.08;
+
+  return { emotion: winner, intensity: THREE.MathUtils.clamp(intensity, 0.2, 1.0) };
+}
+
+function setEmotionTarget(text, role, eventType) {
+  const result = inferEmotionFromText(text, role, eventType);
+  emotionState.target = result.emotion;
+  emotionState.targetIntensity = result.intensity;
+  emotionState.holdUntilMs = performance.now() + 3800;
+}
+
+function updateEmotionExpressions(delta) {
+  if (!vrm || !vrm.expressionManager) return;
+
+  if (!speaking && performance.now() > emotionState.holdUntilMs) {
+    emotionState.target = 'neutral';
+    emotionState.targetIntensity = 0.08;
+  }
+
+  const ease = Math.min(1, delta * 4.0);
+  emotionState.intensity = THREE.MathUtils.lerp(emotionState.intensity, emotionState.targetIntensity, ease);
+
+  const i = emotionState.intensity;
+  let targets = {
+    joy: 0,
+    fun: 0,
+    angry: 0,
+    sorrow: 0,
+    surprised: 0,
+    relaxed: 0.03,
+  };
+
+  if (emotionState.target === 'joy') {
+    targets.joy = i * 0.62;
+    targets.fun = i * 0.35;
+  } else if (emotionState.target === 'angry') {
+    targets.angry = i * 0.64;
+  } else if (emotionState.target === 'sorrow') {
+    targets.sorrow = i * 0.68;
+    targets.relaxed = i * 0.16;
+  } else if (emotionState.target === 'surprised') {
+    targets.surprised = i * 0.72;
+  } else if (emotionState.target === 'relaxed') {
+    targets.relaxed = 0.10 + i * 0.48;
+  }
+
+  for (const key of Object.keys(emotionState.current)) {
+    const targetValue = THREE.MathUtils.clamp(targets[key] || 0, 0, 1);
+    emotionState.current[key] = THREE.MathUtils.lerp(emotionState.current[key], targetValue, Math.min(1, delta * 7.5));
+  }
+
+  const joyPreset = VRMExpressionPresetName.Joy || 'joy';
+  const funPreset = VRMExpressionPresetName.Fun || 'fun';
+  const angryPreset = VRMExpressionPresetName.Angry || 'angry';
+  const sorrowPreset = VRMExpressionPresetName.Sorrow || 'sorrow';
+  const surprisedPreset = VRMExpressionPresetName.Surprised || 'surprised';
+  const relaxedPreset = VRMExpressionPresetName.Relaxed || 'relaxed';
+
+  vrm.expressionManager.setValue(joyPreset, emotionState.current.joy);
+  vrm.expressionManager.setValue(funPreset, emotionState.current.fun);
+  vrm.expressionManager.setValue(angryPreset, emotionState.current.angry);
+  vrm.expressionManager.setValue(sorrowPreset, emotionState.current.sorrow);
+  vrm.expressionManager.setValue(surprisedPreset, emotionState.current.surprised);
+  vrm.expressionManager.setValue(relaxedPreset, emotionState.current.relaxed);
 }
 
 function connectBridge() {
@@ -262,14 +409,7 @@ function setMouthShape(openValue) {
 }
 
 function setTalkingFace(talkAmount) {
-  if (!vrm || !vrm.expressionManager) return;
-
-  const amount = THREE.MathUtils.clamp(talkAmount, 0, 1);
-  const joyPreset = VRMExpressionPresetName.Joy || 'joy';
-  const funPreset = VRMExpressionPresetName.Fun || 'fun';
-
-  vrm.expressionManager.setValue(joyPreset, amount * 0.22);
-  vrm.expressionManager.setValue(funPreset, amount * 0.14);
+  void talkAmount;
 }
 
 
@@ -310,6 +450,35 @@ function updateLipSync(delta) {
   mouthOpen = THREE.MathUtils.lerp(mouthOpen, mouthTarget, smooth);
   setMouthShape(mouthOpen);
   setTalkingFace(mouthOpen);
+}
+
+function updateEyebrowAnimation(delta) {
+  if (!vrm || !vrm.expressionManager) return;
+
+  browShiftTimer += delta;
+  if (browShiftTimer >= nextBrowShiftTime) {
+    browShiftTimer = 0;
+    nextBrowShiftTime = 1.2 + Math.random() * 2.2;
+    browRandomTarget = THREE.MathUtils.randFloat(-0.18, 0.22);
+  }
+
+  browRandom = THREE.MathUtils.lerp(browRandom, browRandomTarget, Math.min(1, delta * 1.8));
+
+  const talkTarget = speaking ? mouthOpen : 0;
+  browTalk = THREE.MathUtils.lerp(browTalk, talkTarget, Math.min(1, delta * 6.5));
+
+  const raiseFromTalk = browTalk * 0.30;
+  const raiseFromRandom = Math.max(0, browRandom);
+  const lowerFromRandom = Math.max(0, -browRandom);
+
+  const surprised = THREE.MathUtils.clamp(0.04 + raiseFromTalk + raiseFromRandom, 0, 0.72);
+  const angry = THREE.MathUtils.clamp(lowerFromRandom * 0.45, 0, 0.35);
+
+  const surprisedPreset = VRMExpressionPresetName.Surprised || 'surprised';
+  const angryPreset = VRMExpressionPresetName.Angry || 'angry';
+
+  vrm.expressionManager.setValue(surprisedPreset, surprised);
+  vrm.expressionManager.setValue(angryPreset, angry);
 }
 
 // --------------------
@@ -415,6 +584,9 @@ function updateBlink(delta) {
 function updateHeadLookAtCamera(head, neck, delta) {
   if (!head || !head.parent) return;
 
+  const focusTarget = speaking ? 1 : 0;
+  speakingFocus = THREE.MathUtils.lerp(speakingFocus, focusTarget, Math.min(1, delta * 6.5));
+
   lookShiftTimer += delta;
   if (lookShiftTimer >= nextLookShiftTime) {
     lookShiftTimer = 0;
@@ -441,19 +613,35 @@ function updateHeadLookAtCamera(head, neck, delta) {
   const microRoll = Math.sin(idleTime * 0.65 + 0.7) * 0.018;
   const talkNod = speaking ? Math.sin(idleTime * 18.0) * 0.012 : 0;
 
-  const targetYaw = THREE.MathUtils.clamp(cameraYaw * 0.72 + lookYawBias + microYaw, -0.55, 0.55);
-  const targetPitch = THREE.MathUtils.clamp(cameraPitch * 0.68 + lookPitchBias + microPitch + talkNod, -0.30, 0.30);
-  const targetRoll = THREE.MathUtils.clamp(lookRollBias + microRoll, -0.14, 0.14);
+  const cameraWeight = THREE.MathUtils.lerp(0.72, 0.97, speakingFocus);
+  const biasWeight = THREE.MathUtils.lerp(1.0, 0.22, speakingFocus);
+  const microWeight = THREE.MathUtils.lerp(1.0, 0.5, speakingFocus);
+
+  const targetYaw = THREE.MathUtils.clamp(
+    cameraYaw * cameraWeight + lookYawBias * biasWeight + microYaw * microWeight,
+    -0.55,
+    0.55
+  );
+  const targetPitch = THREE.MathUtils.clamp(
+    cameraPitch * (cameraWeight - 0.06) + lookPitchBias * biasWeight + microPitch * microWeight + talkNod,
+    -0.30,
+    0.30
+  );
+  const targetRoll = THREE.MathUtils.clamp(lookRollBias * biasWeight + microRoll * microWeight, -0.14, 0.14);
+
+  const neckLerp = THREE.MathUtils.lerp(0.10, 0.16, speakingFocus);
+  const headLerp = THREE.MathUtils.lerp(0.16, 0.24, speakingFocus);
+  const rollLerp = THREE.MathUtils.lerp(0.14, 0.20, speakingFocus);
 
   if (neck) {
-    neck.rotation.y = THREE.MathUtils.lerp(neck.rotation.y, targetYaw * 0.35, 0.10);
-    neck.rotation.x = THREE.MathUtils.lerp(neck.rotation.x, targetPitch * 0.28, 0.10);
-    neck.rotation.z = THREE.MathUtils.lerp(neck.rotation.z, targetRoll * 0.40, 0.10);
+    neck.rotation.y = THREE.MathUtils.lerp(neck.rotation.y, targetYaw * 0.35, neckLerp);
+    neck.rotation.x = THREE.MathUtils.lerp(neck.rotation.x, targetPitch * 0.28, neckLerp);
+    neck.rotation.z = THREE.MathUtils.lerp(neck.rotation.z, targetRoll * 0.40, neckLerp);
   }
 
-  head.rotation.y = THREE.MathUtils.lerp(head.rotation.y, targetYaw, 0.16);
-  head.rotation.x = THREE.MathUtils.lerp(head.rotation.x, targetPitch, 0.16);
-  head.rotation.z = THREE.MathUtils.lerp(head.rotation.z, targetRoll, 0.14);
+  head.rotation.y = THREE.MathUtils.lerp(head.rotation.y, targetYaw, headLerp);
+  head.rotation.x = THREE.MathUtils.lerp(head.rotation.x, targetPitch, headLerp);
+  head.rotation.z = THREE.MathUtils.lerp(head.rotation.z, targetRoll, rollLerp);
 }
 
 function updateIdleAnimation(delta) {
@@ -573,6 +761,7 @@ function animate(currentTime) {
     updateIdleAnimation(delta);
     updateBlink(delta);
     updateLipSync(delta);
+    updateEyebrowAnimation(delta);
     vrm.update(delta);  
   }
 

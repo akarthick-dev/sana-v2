@@ -87,8 +87,6 @@ async def voice(text, output_file=None):
                     output_file.write_bytes(audio_bytes)
                     return output_file.name
         except Exception as exc:
-            last_error = exc
-            # Retry only transient failures.
             message = str(exc)
             if "Response 400:" in message or "Response 401:" in message or "Response 403:" in message:
                 break

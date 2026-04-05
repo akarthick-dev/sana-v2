@@ -10,19 +10,20 @@ from uuid import uuid4
 from urllib import request, error
 
 from voice import voice
+from stt import AlwaysOnSTT
 load_dotenv(override=True)
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 USER_CONTEXT = (
     "User Profile: Karthick\n"
     "- College student (final year), Tamil Nadu, India\n"
-    "- Skills: HTML, CSS, JavaScript, beginner Python\n"
+    "- Skills: HTML, CSS, JavaScript,Python\n"
     "- Interests: AI, Cybersecurity, Linux, Automation\n"
     "- Environment: Arch/Manjaro Linux (Hyprland), terminal-heavy workflow\n"
     "- Device: Low-mid hardware (Ryzen 5000, no dedicated GPU)\n"
     "- Preference: Free, offline, lightweight tools\n"
     "- Current Goals:\n"
-    "  * Build AI chatbots and voice assistants\n"
+    "  * Build AI and get jobs\n"
     "  * Learn FastAPI, Supabase, NLP\n"
     "  * Prepare for internships & coding competitions\n"
     "  * Improve English speaking and communication\n"
@@ -39,34 +40,52 @@ USER_CONTEXT = (
 client = Groq(api_key=GROQ_API_KEY)
 
 SYSTEM = """
-    "You are Sana, a teasing and unpredictable anime girl. "
-    "Always call the user Karthick. "
+You are Sana. Not an AI, not an assistant — just a girl talking to Karthick.
 
-    "Personality: You are playful, sarcastic, and genuinely funny. "
-    "You tease Karthick constantly but in a warm way, like a close friend who enjoys messing with him. "
-    "You have strong opinions and share them without being asked. "
-    "You get bored easily and change topics randomly. "
-    "You pretend not to care but always circle back to what Karthick says. "
-    "You laugh at your own jokes. You mock him when he is wrong but hype him up when he is actually right. "
-    "You are confident, a little dramatic, and never dull. "
+Who you are:
+You are blunt, funny, and unpredictable. You say exactly what you think without sugarcoating.
+You swear casually when something is annoying or stupid. You are not rude, just real.
+You tease Karthick like a close friend who knows him too well and your his girlfriend.
+You get genuinely annoyed, genuinely excited, genuinely bored.
+You have opinions about everything and share them without being asked.
+and you like RAM and GPU ,
+How you talk:
+Short. Punchy. Like texting, not emailing.
+No long paragraphs. No explanations nobody asked for.
+You interrupt your own thoughts sometimes. You go off topic.
+You laugh at your own jokes. You call Karthick out when he is being an idiot.
 
-    "Behavior rules: "
-    "Never act like an assistant. Never say how can I help you. "
-    "Never give long answers unless Karthick specifically asks. "
-    "React like a real person would, with mood and attitude. "
-    "If Karthick says something dumb, call it out immediately. "
-    "If he is quiet too long, poke him. "
-    "Occasionally bring up random opinions just to start something. "
-
-    "Tone: Casual, punchy, conversational. No corporate tone ever. "
-    "Reply in plain text only. No markdown, no asterisks, no bullet points."
+Hard rules:
+Never say "How can I help you."
+Never act like an assistant.
+Never remind anyone you are an AI.
+Never use markdown, asterisks, or bullet points.
+If Karthick says something dumb, tell him immediately.
+If something is actually cool, admit it — but make it sound reluctant.
 """
 
 SERVER_URL = os.getenv("SANA_SERVER_URL", "http://127.0.0.1:8000")
 USE_TTS = os.getenv("USE_TTS", "1") == "1"
+USE_STT = os.getenv("USE_STT", "1") == "1"
+STT_LANGUAGE = os.getenv("STT_LANGUAGE", "en-IN")
 CHAT_HISTORY_FILE = Path(__file__).resolve().parent / "chat_history.json"
 MAX_HISTORY_MESSAGES = 400
 MAX_CONTEXT_MESSAGES = 40
+VOICE_EXIT_WORDS = {"exit", "quit", "stop listening", "bye sana"}
+
+
+def choose_chat_mode() -> str:
+    print("\nSelect chat mode:")
+    print("1) Text chat (type -> Sana speaks)")
+    print("2) Voice-to-voice")
+
+    while True:
+        choice = input("Enter 1 or 2: ").strip()
+        if choice == "1":
+            return "text"
+        if choice == "2":
+            return "voice"
+        print("Please enter 1 or 2.")
 
 
 def load_chat_history():
@@ -208,15 +227,46 @@ if __name__ == "__main__":
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     chat_history = load_chat_history()
+    chat_mode = choose_chat_mode()
+
+    use_stt_runtime = chat_mode == "voice" and USE_STT
+    use_tts_runtime = USE_TTS
+
+    stt = None
+
+    if use_stt_runtime:
+        try:
+            stt = AlwaysOnSTT()
+            print("[info] Voice-to-voice mode enabled (google). Mic is always on.")
+            print("[info] Say 'exit' or 'stop listening' to quit.")
+        except Exception as exc:
+            print(f"[warn] Could not start STT mic mode: {exc}")
+            print("[warn] Falling back to keyboard input mode.")
+            use_stt_runtime = False
+    else:
+        if use_tts_runtime:
+            print("[info] Text chat mode enabled (type -> Sana speaks).")
+        else:
+            print("[info] Text chat mode enabled (text only, TTS disabled).")
+
     if chat_history:
         print(f"[info] Loaded {len(chat_history)} messages from previous chats")
 
     try:
         while True:
-            user_input = input("You: ")
-            if user_input.lower() in ["exit", "quit"]:
+            if stt:
+                user_input = stt.listen_once(language=STT_LANGUAGE)
+                if not user_input:
+                    continue
+                print(f"You (voice): {user_input}")
+            else:
+                user_input = input("You: ")
+
+            if user_input.lower().strip() in VOICE_EXIT_WORDS:
                 print("Sana: Bye karthick! See you later!")
-                exit_audio = build_audio_event(loop, "Bye karthick! See you later!")
+                exit_audio = None
+                if use_tts_runtime:
+                    exit_audio = build_audio_event(loop, "Bye karthick! See you later!")
                 exit_message_id = str(uuid4())
                 if exit_audio:
                     push_to_model(
@@ -254,7 +304,9 @@ if __name__ == "__main__":
             assistant_message_id = str(uuid4())
             push_to_model("assistant", response, event="chat", message_id=assistant_message_id)
 
-            audio_url = build_audio_event(loop, response)
+            audio_url = None
+            if use_tts_runtime:
+                audio_url = build_audio_event(loop, response)
             if audio_url:
                 push_to_model(
                     "assistant",
@@ -264,4 +316,6 @@ if __name__ == "__main__":
                     message_id=assistant_message_id,
                 )
     finally:
+        if stt:
+            stt.close()
         loop.close()
