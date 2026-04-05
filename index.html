@@ -95,6 +95,7 @@ let nextBrowShiftTime = 1.6;
 let browRandomTarget = 0;
 let browRandom = 0;
 let browTalk = 0;
+let browBones = [];
 let userActivatedAudio = false;
 const assistantAudio = new Audio();
 assistantAudio.preload = 'auto';
@@ -453,7 +454,8 @@ function updateLipSync(delta) {
 }
 
 function updateEyebrowAnimation(delta) {
-  if (!vrm || !vrm.expressionManager) return;
+  if (!vrm) return;
+  if (browBones.length === 0) return;
 
   browShiftTimer += delta;
   if (browShiftTimer >= nextBrowShiftTime) {
@@ -467,18 +469,44 @@ function updateEyebrowAnimation(delta) {
   const talkTarget = speaking ? mouthOpen : 0;
   browTalk = THREE.MathUtils.lerp(browTalk, talkTarget, Math.min(1, delta * 6.5));
 
-  const raiseFromTalk = browTalk * 0.30;
+  const raiseFromTalk = browTalk * 0.12;
   const raiseFromRandom = Math.max(0, browRandom);
   const lowerFromRandom = Math.max(0, -browRandom);
 
-  const surprised = THREE.MathUtils.clamp(0.04 + raiseFromTalk + raiseFromRandom, 0, 0.72);
-  const angry = THREE.MathUtils.clamp(lowerFromRandom * 0.45, 0, 0.35);
+  const raise = THREE.MathUtils.clamp(0.01 + raiseFromTalk + raiseFromRandom * 0.07, -0.03, 0.12);
+  const lower = THREE.MathUtils.clamp(lowerFromRandom * 0.06, 0, 0.08);
 
-  const surprisedPreset = VRMExpressionPresetName.Surprised || 'surprised';
-  const angryPreset = VRMExpressionPresetName.Angry || 'angry';
+  for (let i = 0; i < browBones.length; i++) {
+    const entry = browBones[i];
+    const name = entry.bone.name.toLowerCase();
+    const sideOffset = name.includes('left') ? -0.004 : name.includes('right') ? 0.004 : 0;
+    const targetX = entry.baseX - raise + lower + sideOffset;
+    entry.bone.rotation.x = THREE.MathUtils.lerp(entry.bone.rotation.x, targetX, Math.min(1, delta * 8.5));
+  }
+}
 
-  vrm.expressionManager.setValue(surprisedPreset, surprised);
-  vrm.expressionManager.setValue(angryPreset, angry);
+function cacheEyebrowBones() {
+  if (!vrm || browBones.length > 0) return;
+
+  const collected = [];
+  vrm.scene.traverse((obj) => {
+    if (!obj.isBone) return;
+    const name = obj.name.toLowerCase();
+    if (name.includes('brow') || name.includes('eyebrow')) {
+      collected.push(obj);
+    }
+  });
+
+  browBones = collected.slice(0, 8).map((bone) => ({
+    bone,
+    baseX: bone.rotation.x,
+  }));
+
+  if (browBones.length > 0) {
+    console.log(`✅ Eyebrow bones detected: ${browBones.length}`);
+  } else {
+    console.log('ℹ️ No eyebrow bones detected. Brows animation skipped to protect lip sync.');
+  }
 }
 
 // --------------------
@@ -500,6 +528,7 @@ function loadVRM() {
       vrm.scene.rotation.y = Math.PI;
 
       scene.add(vrm.scene);
+      cacheEyebrowBones();
 
       console.log("✅ VRM loaded:", vrm);
 
